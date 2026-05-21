@@ -3,7 +3,7 @@
  * @作者           : 树
  * @创建时间         : 2026-05-21 14:16:07
  * @最后编辑         : 树
- * @最后编辑时间       : 2026-05-21 14:39:53
+ * @最后编辑时间       : 2026-05-21 14:51:49
  * @Version      : V1.0.0
  * @功能描述         : 一个简单的TCP客户端循环示例，每2秒向服务器发送一次控制命令并接收响应。
  * @Copyright    : Copyright (c) 2026 by 树, All Rights Reserved.
@@ -59,9 +59,10 @@ static int send_once(const char *host, int port, int count)
     double wz = 0.20;
 
     char cmd[128];
-    snprintf(cmd, sizeof(cmd), "CMD:%.2f,%.2f,%.2f", vx, vy, wz);
+    snprintf(cmd, sizeof(cmd), "CMD %.2f %.2f %.2f", vx, vy, wz);
 
     printf("loop %d TX: %s", count, cmd);
+    fflush(stdout);
 
     // 发送命令到服务器
     if (send(sock, cmd, strlen(cmd), 0) < 0)
