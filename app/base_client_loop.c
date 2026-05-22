@@ -3,10 +3,24 @@
  * @作者           : 树
  * @创建时间         : 2026-05-21 14:16:07
  * @最后编辑         : 树
- * @最后编辑时间       : 2026-05-21 17:44:34
+ * @最后编辑时间       : 2026-05-22 14:23:09
  * @Version      : V1.0.0
  * @功能描述         : 一个简单的TCP客户端循环示例，每2秒向服务器发送一次控制命令并接收响应。
- * @Copyright    : Copyright (c) 2026 by 树, All Rights Reserved.
+ *
+ * 业务流程说明（面向产品/运营的高层描述）:
+ * - 启动时读取配置（优先从指定路径读取配置文件，否则使用内置默认值）。
+ * - 建立一个循环（周期由配置项 period_ms/默认2秒决定），每次循环：
+ *     1. 构造一条控制命令（格式："CMD <seq> <vx> <vy> <wz>"），其含义为请求设备以给定线速度(vx,vy)
+ *        和角速度(wz)执行一次驱动动作，seq 用于识别请求序列号。此命令按文本协议发送到远端控制服务器。
+ *     2. 与服务器建立短连接（TCP），发送命令并等待一次响应，然后关闭连接。
+ *     3. 解析服务器响应（期望格式："STA <seq> <vx> <vy> <wz> <battery> <err>"），并将状态/电量/错误码按业务语义打印/记录。
+ *     4. 如果连接或收发失败，打印警告并在下次循环重试（客户端不长连接、不重传具体命令，仅记录失败并继续）。
+ * - 该程序为演示型客户端，侧重命令/状态的交互与简单错误提示，适合作为上层调试或集成测试工具。
+ *
+ * 关键业务注意点：
+ * - 协议为行文本协议（以 "\n" 结尾），易于人工调试与日志收集；生产环境可迁移为二进制或更严格的帧协议。
+ * - 序号 `seq` 用于检测消息乱序或重放；当响应中 seq 与请求不同时，会记录 WARN 以便排查网络问题。
+ * - `battery` 为浮点数，表示百分比，程序打印到日志用于监控设备电量。
  */
 
 #include <stdio.h>
@@ -16,44 +30,120 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
+#define DEFAULT_CONFIG "/etc/base-client.conf"
+
+typedef struct
+{
+    char server_ip[64];
+    int server_port;
+    int period_ms;
+    double vx;
+    double vy;
+    double wz;
+} AppConfig;
+
 /*
- * 详细技术注释（低级实现细节、跨平台与安全注意事项）
- *
- * 头文件用途：
- * - <stdio.h> / <stdlib.h>: 标准I/O与内存/退出管理；用于打印与字符串/数值转换。
- * - <unistd.h>: POSIX API（如 close、sleep）；在 Windows 上需替代实现。
- * - <string.h>: 字符串/内存操作（memset、strcmp、strlen）。
- * - <arpa/inet.h>: 提供网络地址转换（inet_pton、ntohl/htonl），处理 IPv4 地址文本/二进制转换。
- * - <sys/socket.h>: socket API 的核心声明（socket、connect、send、recv、bind、listen、accept）。
- *
- * 字节序与端口：
- * - 网络字节序（big-endian）与主机字节序可能不同。使用 htons/ntohs/htonl/ntohl 保证跨平台一致性。
- * - 在此程序中，通过 htons(port) 将主机无符号短整型转换为网络字节序后再赋值给 sockaddr_in。
- *
- * 错误与信号处理建议：
- * - 对于 send，当对端已关闭时可能触发 SIGPIPE 导致进程被终止。生产代码中常用 `signal(SIGPIPE, SIG_IGN)` 或在 send 时使用 `MSG_NOSIGNAL` 标志来避免程序异常退出。
- * - 当前程序在遇到 socket 错误时直接打印 perror 并关闭 socket，这在测试场景足够，但生产代码应区分可重试错误与无法恢复的错误。
- *
- * 阻塞行为、超时与可扩展性：
- * - 本例使用阻塞 socket，connect/send/recv 会阻塞当前线程。对于 GUI 或并发客户端，应使用非阻塞 socket + select/epoll 或专用工作线程。
- * - 可通过 setsockopt(..., SO_RCVTIMEO) 或 select/poll 实现读超时，避免长时间阻塞。
- *
- * I/O 原子性与部分发送/接收：
- * - send 不保证一次写入将全部发送（尤其大数据）；应使用循环直到发送完毕（检查返回值并移动指针）。本例发送的数据短，通常一次发送完成。
- * - recv 可能返回部分消息、多个消息或在消息中间断开。文件中使用了按换行拆分的缓冲处理，但仍需处理边界情况（无换行时继续累积，避免无限增长）。
- *
- * 安全与缓冲：
- * - snprintf 在缓冲区不足时会截断，要检查返回值是否>=bufsize以检测截断。
- * - 使用固定大小的栈缓冲区（如 char buf[256]）时要考虑输入数据可能超过预期长度，避免缓冲区溢出。生产代码可考虑动态缓冲或限制每次读取量并丢弃超长行。
- *
- * 文本协议解析注意事项：
- * - sscanf 易用但不够健壮：当输入格式不严格或存在异常字符时可能解析失败或出现未定义行为。
- * - 推荐使用更安全的解析方式，如 strtok + strtol/strtod 或手写有限状态机来逐字段解析并检查边界与返回值。
+ * set_default_config: 为业务运行设置安全的默认配置。
+ * 业务含义：当没有外部配置文件时，客户端仍需能与默认模拟/测试服务器通信，
+ * 因此填充合理的IP/端口/周期及默认运动指令参数，便于本地开发和CI环境使用。
  */
+static void set_default_config(AppConfig *cfg)
+{
+    snprintf(cfg->server_ip, sizeof(cfg->server_ip), "10.0.2.2");
+    cfg->server_port = 7000;
+    cfg->period_ms = 2000;
+    cfg->vx = 0.10;
+    cfg->vy = 0.00;
+    cfg->wz = 0.20;
+}
 
-#define DEFAULT_HOST "10.0.2.2" // 默认目标主机地址
-#define DEFAULT_PORT 7000       // 默认目标端口号
+/*
+ * trim: 去除字符串两端的空白字符（空格、制表、换行等）。
+ * 业务角度：读取配置文件或网络文本时会遇到额外空白，需清理以避免解析错误。
+ */
+static char *trim(char *s)
+{
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
+    {
+        s++;
+    }
+    char *end = s + strlen(s) - 1;
+    while (end > s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
+    {
+        *end = '\0';
+        end--;
+    }
 
+    return s;
+}
+
+/*
+ * load_config: 从文本配置文件加载业务参数。
+ * 配置文件格式为 key=value，每行一个配置，可使用 '#' 注释行。
+ * 支持的键：server_ip, server_port, period_ms, vx, vy, wz。
+ * 业务影响：运维/测试可以通过配置文件调整目标服务器地址、循环周期和默认驱动参数，
+ * 便于在不同环境下（模拟器、实机、CI）复用同一二进制。
+ */
+static int load_config(const char *path, AppConfig *cfg)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+    {
+        perror("fopen config");
+        return -1;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp))
+    {
+        char *text = trim(line);
+        if (text[0] == '#' || text[0] == '\0')
+        {
+            continue;
+        }
+        char *eq = strchr(text, '=');
+        if (!eq)
+        {
+            continue;
+        }
+        *eq = '\0';
+        char *key = trim(text);
+        char *value = trim(eq + 1);
+
+        if (strcmp(key, "server_ip") == 0)
+        {
+            snprintf(cfg->server_ip, sizeof(cfg->server_ip), "%s", value);
+        }
+        else if (strcmp(key, "server_port") == 0)
+        {
+            cfg->server_port = atoi(value);
+        }
+        else if (strcmp(key, "period_ms") == 0)
+        {
+            cfg->period_ms = atoi(value);
+        }
+        else if (strcmp(key, "vx") == 0)
+        {
+            cfg->vx = atof(value);
+        }
+        else if (strcmp(key, "vy") == 0)
+        {
+            cfg->vy = atof(value);
+        }
+        else if (strcmp(key, "wz") == 0)
+        {
+            cfg->wz = atof(value);
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
+/*
+ * err_to_text: 将业务错误码转换为易读文本。
+ * 业务含义：服务端返回的错误码代表设备端或指令层面的异常。客户端将错误码转换为文本输出，
+ * 方便日志聚合和人工排查，例如 LOW_BATTERY 表示设备电量低，应触发告警或回收策略。
+ */
 static const char *err_to_text(int err)
 {
     switch (err)
@@ -72,7 +162,7 @@ static const char *err_to_text(int err)
 }
 
 // 发送一次命令并接收服务器响应
-static int send_once(const char *host, int port, int seq)
+static int send_once(const AppConfig *cfg, int seq)
 {
     // 创建TCP socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -86,10 +176,10 @@ static int send_once(const char *host, int port, int seq)
     memset(&server_addr, 0, sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port); // 将端口转换为网络字节序
+    server_addr.sin_port = htons(cfg->server_port); // 将端口转换为网络字节序
 
     // 将IP字符串转换为网络地址结构
-    if (inet_pton(AF_INET, host, &server_addr.sin_addr) != 1)
+    if (inet_pton(AF_INET, cfg->server_ip, &server_addr.sin_addr) != 1)
     {
         perror("inet_pton");
         close(sock);
@@ -104,13 +194,8 @@ static int send_once(const char *host, int port, int seq)
         return -1;
     }
 
-    // 构造要发送的控制命令数据
-    double vx = 0.10;
-    double vy = 0.00;
-    double wz = 0.20;
-
     char cmd[128];
-    snprintf(cmd, sizeof(cmd), "CMD %d %.2f %.2f %.2f\n", seq, vx, vy, wz);
+    snprintf(cmd, sizeof(cmd), "CMD %d %.2f %.2f %.2f\n", seq, cfg->vx, cfg->vy, cfg->wz);
 
     printf("loop %d TX: %s", seq, cmd);
     fflush(stdout);
@@ -157,7 +242,15 @@ static int send_once(const char *host, int port, int seq)
      */
     char tag[16];
     int rx_seq = -1;
-    double rx_vx = 0.0; // 修正类型：双精度以匹配 %lf
+    /*
+     * send_once: 与控制服务器建立短连接，发送一次控制命令并等待状态响应。
+     * 输入：配置（包含目标IP/端口和运动指令参数）和 seq（业务序号）。
+     * 输出：0 表示发送并成功解析响应（或至少收到可解析的响应），-1 表示通信/解析失败。
+     * 业务流程：
+     *  1) 建立 TCP 连接 -> 2) 发送文本命令 CMD -> 3) 等待单次响应 STA -> 4) 解析并打印/记录 -> 5) 关闭连接
+     * 注意：此处采用短连接策略（每次命令建立新连接），便于演示和避免长连接管理复杂性。
+     */
+    double rx_vx = 0.0;
     double rx_vy = 0.0;
     double rx_wz = 0.0;
     double battery = 0.0; // 电量通常为浮点数（服务器格式为两位小数）
@@ -190,28 +283,31 @@ static int send_once(const char *host, int port, int seq)
 
 int main(int argc, char *argv[])
 {
-    const char *host = DEFAULT_HOST;
-    int port = DEFAULT_PORT;
+    const char *config_path = DEFAULT_CONFIG;
+    AppConfig cfg;
     int seq = 0;
 
-    // 读取命令行参数，允许指定目标主机和端口
     if (argc > 1)
     {
-        host = argv[1];
+        config_path = argv[1];
     }
 
-    if (argc > 2)
+    set_default_config(&cfg);
+
+    if (load_config(config_path, &cfg) != 0)
     {
-        port = atoi(argv[2]);
+        printf("WARN: use default config\n");
+        fflush(stdout);
     }
 
-    printf("base client loop started,target=%s:%d\n", host, port);
+    printf("base client loop started\n");
+    printf("config:server_ip=%s server_port=%d period_ms=%d vx=%.2f vy=%.2f wz=%.2f\n",
+           cfg.server_ip, cfg.server_port, cfg.period_ms, cfg.vx, cfg.vy, cfg.wz);
     fflush(stdout);
 
-    // 无限循环，每次发送一次命令，失败则重试
     while (1)
     {
-        if (send_once(host, port, seq) != 0)
+        if (send_once(&cfg, seq) != 0)
         {
             printf("loop %d failed,will retry\n", seq);
             fflush(stdout);
@@ -219,6 +315,5 @@ int main(int argc, char *argv[])
         seq++;
         sleep(2); // 每2秒发送一次
     }
-
     return 0;
 }
