@@ -3,7 +3,7 @@
  * @作者           : 树
  * @创建时间         : 2026-05-21 14:16:07
  * @最后编辑         : 树
- * @最后编辑时间       : 2026-05-22 16:22:25
+ * @最后编辑时间       : 2026-05-22 14:23:09
  * @Version      : V1.0.0
  * @功能描述         : 一个简单的TCP客户端循环示例，每2秒向服务器发送一次控制命令并接收响应。
  *
@@ -27,21 +27,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <stdarg.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <time.h>
-#include <errno.h>
 
 #define DEFAULT_CONFIG "/etc/base-client.conf"
-/*
- * AppConfig: 保存运行时可配置的业务参数。
- * - server_ip/server_port: 目标控制服务器的地址和端口。
- * - period_ms: 主循环周期（毫秒），当前实现中示例使用固定 sleep(2)，
- *   若需要严谨周期控制应使用基于时间的调度以避免 drift。
- * - vx/vy/wz: 业务层的线速度/角速度指令（默认值用于演示或临时调试）。
- * - log_file: 可选日志文件路径，程序可将日志追加到此文件以便长期存储。
- */
+
 typedef struct
 {
     char server_ip[64];
@@ -50,10 +40,8 @@ typedef struct
     double vx;
     double vy;
     double wz;
-    char log_file[128];
 } AppConfig;
 
-static FILE *g_log_fp = NULL; /* 全局日志文件指针；若成功打开则向磁盘追加日志 */
 /*
  * set_default_config: 为业务运行设置安全的默认配置。
  * 业务含义：当没有外部配置文件时，客户端仍需能与默认模拟/测试服务器通信，
@@ -67,7 +55,6 @@ static void set_default_config(AppConfig *cfg)
     cfg->vx = 0.10;
     cfg->vy = 0.00;
     cfg->wz = 0.20;
-    snprintf(cfg->log_file, sizeof(cfg->log_file), "/var/log/base_client.log");
 }
 
 /*
@@ -80,11 +67,6 @@ static char *trim(char *s)
     {
         s++;
     }
-    if (*s == '\0')
-    {
-        return s;
-    }
-
     char *end = s + strlen(s) - 1;
     while (end > s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
     {
@@ -157,70 +139,6 @@ static int load_config(const char *path, AppConfig *cfg)
     return 0;
 }
 
-static int open_log_file(const char *path)
-{
-    g_log_fp = fopen(path, "a");
-    if (!g_log_fp)
-    {
-        perror("fopen log");
-        return -1;
-    }
-    return 0;
-}
-
-static void close_log_file(void)
-{
-    if (g_log_fp)
-    {
-        fclose(g_log_fp);
-        g_log_fp = NULL;
-    }
-}
-
-static void get_time_string(char *buf, size_t size)
-{
-    time_t now = time(NULL);
-    struct tm tm_info;
-    localtime_r(&now, &tm_info);
-    strftime(buf, size, "%Y-%m-%d %H:%M:%S", &tm_info);
-}
-
-static void log_msg(const char *level, const char *fmt, ...)
-{
-    char time_buf[32];
-    char msg_buf[512];
-    get_time_string(time_buf, sizeof(time_buf));
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(msg_buf, sizeof(msg_buf), fmt, args);
-    va_end(args);
-    /*
-     * open_log_file: 打开日志文件（追加模式）并设置全局文件指针。
-     * 业务目的：将运行日志持久化到磁盘，便于离线分析与故障排查。
-     * 返回值：0 表示成功，-1 表示打开失败（已通过 perror 打印错误原因）。
-     * 注意事项：
-     *  - 使用追加模式("a")会在每次写入时自动移动到文件尾，适合单进程多次追加场景。
-     *  - 本函数非线程安全；若在多线程环境中写日志，请使用互斥或选择线程安全的日志库。
-     *  - 未实现日志轮转或大小限制，生产环境需配合外部日志轮转（logrotate）或在程序内实现轮转逻辑。
-     */
-
-    /* 将格式化后的日志输出到 stdout；同时可选写入文件（若 g_log_fp 非空）。
-     * 业务说明：标准输出便于交互调试与容器日志采集，文件写入用于长期保存。
-     * 实现细节与限制：
-     *  - 使用 vsnprintf 将可变参数格式化到固定大小缓冲区 msg_buf（512 字节）。
-     *    返回值可用于检测截断：若返回值 < 0 表示编码错误，若返回值 >= sizeof(msg_buf) 表示输出被截断。
-     *  - 当前实现没有检查 vsnprintf 的返回值；在日志非常长或参数异常时可能导致截断且信息丢失。
-     *  - 为保证日志按时间顺序写入并能被外部系统及时收集，调用后立即 flush（stdout 和文件）。
-     */
-    printf("%s [%s] %s\n", time_buf, level, msg_buf);
-    fflush(stdout);
-
-    if (g_log_fp)
-    {
-        fprintf(g_log_fp, "%s [%s] %s\n", time_buf, level, msg_buf);
-        fflush(g_log_fp);
-    }
-}
 /*
  * err_to_text: 将业务错误码转换为易读文本。
  * 业务含义：服务端返回的错误码代表设备端或指令层面的异常。客户端将错误码转换为文本输出，
@@ -250,8 +168,7 @@ static int send_once(const AppConfig *cfg, int seq)
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0)
     {
-        /* strerror 返回字符串，格式化时应使用 %s */
-        log_msg("ERROR", "socket failed: %s", strerror(errno));
+        perror("socket");
         return -1;
     }
 
@@ -264,7 +181,7 @@ static int send_once(const AppConfig *cfg, int seq)
     // 将IP字符串转换为网络地址结构
     if (inet_pton(AF_INET, cfg->server_ip, &server_addr.sin_addr) != 1)
     {
-        log_msg("ERROR", "inet_pton failed for ip=%s", cfg->server_ip);
+        perror("inet_pton");
         close(sock);
         return -1;
     }
@@ -272,7 +189,7 @@ static int send_once(const AppConfig *cfg, int seq)
     // 连接服务器
     if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
     {
-        log_msg("ERROR", "connect %s:%d failed:%s", cfg->server_ip, cfg->server_port, strerror(errno));
+        perror("connect");
         close(sock);
         return -1;
     }
@@ -280,15 +197,13 @@ static int send_once(const AppConfig *cfg, int seq)
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "CMD %d %.2f %.2f %.2f\n", seq, cfg->vx, cfg->vy, cfg->wz);
 
-    log_msg("INFO", "loop=%d TX: %s", seq, cmd);
+    printf("loop %d TX: %s", seq, cmd);
+    fflush(stdout);
 
-    /* 发送命令到服务器
-     * 注意：send 可能返回已发送字节数小于请求长度（部分发送），
-     * 对于短文本命令这通常不会发生，但严格实现应循环发送直到所有字节发送完毕或出错。
-     */
+    // 发送命令到服务器
     if (send(sock, cmd, strlen(cmd), 0) < 0)
     {
-        log_msg("ERROR", "send failed: %s", strerror(errno));
+        perror("send");
         close(sock);
         return -1;
     }
@@ -296,14 +211,11 @@ static int send_once(const AppConfig *cfg, int seq)
     char buf[256];
     memset(buf, 0, sizeof(buf));
 
-    /* 接收服务器响应（单次 recv）
-     * 说明：单次 recv 可能读到部分报文或包含多条报文；鉴于协议为行文本，理想做法是循环读取直到遇到 '\n'。
-     * 本示例为简化逻辑仅做一次 recv，适用于服务端一次性返回且数据量较小的场景。
-     */
+    // 接收服务器响应
     int n = recv(sock, buf, sizeof(buf) - 1, 0);
     if (n < 0)
     {
-        log_msg("ERROR", "recv failed: %s", strerror(errno));
+        perror("recv");
         close(sock);
         return -1;
     }
@@ -311,13 +223,13 @@ static int send_once(const AppConfig *cfg, int seq)
     if (n == 0)
     {
         // 服务器关闭了连接
-        log_msg("WARN", "loop %d server closed connection", seq);
+        printf("loop %d RX: server closed connection\n", seq);
         close(sock);
         return -1;
     }
 
     buf[n] = '\0'; // 确保字符串以null结尾
-    log_msg("INFO", "loop %d RX: %s", seq, buf);
+    printf("loop %d RX: %s", seq, buf);
 
     /*
      * 解析响应时注意类型匹配：
@@ -350,28 +262,21 @@ static int send_once(const AppConfig *cfg, int seq)
     {
         if (rx_seq != seq)
         {
-            log_msg("WARN", "loop %d WARN: seq mismatch,rx_seq=%d", seq, rx_seq);
+            printf("loop %d WARN: seq mismatch,rx_seq=%d\n", seq, rx_seq);
         }
 
         /*
          * 输出时注意类型：rx_vx/ry_vy/rx_wz 为 double，battery 为 double。
          * 原代码以 %d 打印 battery，会截断并导致错误显示，改为打印浮点或四舍五入为整数。
          */
-        log_msg("INFO", "loop %d STATUS: vx=%.2f,vy=%.2f,wz=%.2f,battery=%.2f%%,err=%s", seq, rx_vx, rx_vy, rx_wz, battery, err_to_text(err));
-
-        if (err == 1)
-        {
-            log_msg("WARN", "loop=%d low battery :%.2f", seq, battery);
-        }
-        else if (err != 0)
-        {
-            log_msg("ERROR", "loop=%d chassis error :%s", seq, err_to_text(err));
-        }
+        printf("loop %d STATUS: vx=%.2f,vy=%.2f,wz=%.2f,battery=%.2f%%,err=%s\n", seq, rx_vx, rx_vy, rx_wz, battery, err_to_text(err));
     }
     else
     {
-        log_msg("WARN", "loop %d WARN: bad response format", seq);
+        printf("loop %d WARN: bad response format\n", seq);
     }
+
+    fflush(stdout);
     close(sock);
     return 0;
 }
@@ -391,28 +296,24 @@ int main(int argc, char *argv[])
 
     if (load_config(config_path, &cfg) != 0)
     {
-        log_msg("WARN", "use default config");
+        printf("WARN: use default config\n");
         fflush(stdout);
     }
 
-    log_msg("INFO", "base client loop started");
-    log_msg("INFO", "config:server_ip=%s server_port=%d period_ms=%d vx=%.2f vy=%.2f wz=%.2f", cfg.server_ip, cfg.server_port, cfg.period_ms, cfg.vx, cfg.vy, cfg.wz);
+    printf("base client loop started\n");
+    printf("config:server_ip=%s server_port=%d period_ms=%d vx=%.2f vy=%.2f wz=%.2f\n",
+           cfg.server_ip, cfg.server_port, cfg.period_ms, cfg.vx, cfg.vy, cfg.wz);
     fflush(stdout);
 
-    /* 主循环：每次调用 send_once 发送一次命令并等待响应。
-     * 注意：此处使用 sleep(2) 固定间隔，未使用 cfg.period_ms；若需要基于配置的周期控制，请替换为
-     * 基于时间戳的等待（例如 clock_gettime + nanosleep），以获得更精确的周期行为并避免累积漂移（drift）。
-     */
     while (1)
     {
         if (send_once(&cfg, seq) != 0)
         {
-            log_msg("WARN", "loop %d failed,will retry", seq);
+            printf("loop %d failed,will retry\n", seq);
             fflush(stdout);
         }
         seq++;
-        sleep(2); // 每2秒发送一次（演示用），生产环境按 cfg.period_ms 精确控制
+        sleep(2); // 每2秒发送一次
     }
-    close_log_file();
     return 0;
 }
