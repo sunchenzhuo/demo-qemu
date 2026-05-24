@@ -3,7 +3,7 @@
  @作者           : 树
  @创建时间         : 2026-05-20 15:13:55
  @最后编辑         : 树
- @最后编辑时间       : 2026-05-21 16:56:26
+ @最后编辑时间       : 2026-05-24 14:39:13
  @Version      : V1.0.0
  @功能描述         : 模拟底盘 TCP 控制服务器，用于接收控制命令并返回状态信息。
  @Copyright    : Copyright (c) 2026 by 树, All Rights Reserved.
@@ -74,6 +74,8 @@ def handle_line(line):
 
     # 模拟电池消耗：每次处理命令时减少固定电量
     battery -= 0.01
+    if battery < 9.0:
+        battery = 9.0  # 电量不能为负
     if battery < LOW_BATTERY and err == ERR_OK:
         # 只有在命令本身合法时，才返回低电量警告
         err = ERR_LOW_BATTERY
