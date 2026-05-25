@@ -3,7 +3,7 @@
  * @作者           : 树
  * @创建时间         : 2026-05-21 14:16:07
  * @最后编辑         : 树
- * @最后编辑时间       : 2026-05-25 15:59:31
+ * @最后编辑时间       : 2026-05-24 17:41:42
  * @Version      : V1.0.0
  * @功能描述         : 一个简单的TCP客户端循环示例，每2秒向服务器发送一次控制命令并接收响应。
  *
@@ -405,9 +405,6 @@ int main(int argc, char *argv[])
     log_msg("INFO", "config:server_ip=%s server_port=%d period_ms=%d vx=%.2f vy=%.2f wz=%.2f", cfg.server_ip, cfg.server_port, cfg.period_ms, cfg.vx, cfg.vy, cfg.wz);
     fflush(stdout);
 
-    int fail_count = 0;       // 连续失败次数
-    int was_disconnected = 0; // 之前是否处于断链状态
-
     /* 主循环：每次调用 send_once 发送一次命令并等待响应。
      * 说明：
      * - 本循环为演示用途，使用固定的 sleep(2) 间隔发送命令；生产环境应使用基于时间的调度
@@ -434,38 +431,10 @@ int main(int argc, char *argv[])
          * - 成功时返回 0，并已在内部打印状态（包括 battery）。
          * - 失败时返回非0，此处仅记录警告并在下次循环重试（不做重传或停机）。
          */
-        /*
-         * 处理一次 send_once 的返回结果：
-         * - 如果返回非0，表示本次通信（连接/发送/接收/解析）失败：
-         *     1) 将连续失败计数 `fail_count` 增加；
-         *     2) 将 `was_disconnected` 置为 1，用于记录当前处于断链/失败状态；
-         *     3) 打印 WARN 日志并立即 flush，以便能够尽快看到错误信息；
-         *     4) 下次循环继续重试（该客户端不做重传，仅记录失败）。
-         * - 如果返回0，表示本次通信成功：
-         *     1) 若之前处于断链状态（`was_disconnected` 为真），打印 INFO 日志说明通信已恢复，日志中包含恢复时的循环序号和之前的连续失败次数；
-         *     2) 将 `fail_count` 重置为 0，清除 `was_disconnected` 标志，恢复正常计数。
-         */
         if (send_once(&cfg, seq) != 0)
         {
-            /* 通信失败，记录并标记为断链状态 */
-            fail_count++;
-            was_disconnected = 1;
-
-            log_msg("WARN", "loop %d communication failed,fail_count=%d,will retry", seq, fail_count);
+            log_msg("WARN", "loop %d failed,will retry", seq);
             fflush(stdout);
-        }
-        else
-        {
-            /* 通信成功，若之前断链则记录恢复信息 */
-            if (was_disconnected)
-            {
-                log_msg("INFO", "communication recovered at loop=%d after %d failures", seq, fail_count);
-                fflush(stdout);
-            }
-
-            /* 重置失败计数和断链标志，恢复正常状态 */
-            fail_count = 0;
-            was_disconnected = 0;
         }
 
         /* 序号递增：用于下一次请求的识别，与服务端返回的 seq 做对比以检测乱序/重放 */
