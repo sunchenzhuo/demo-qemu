@@ -3,7 +3,7 @@
  * @作者           : 树
  * @创建时间         : 2026-05-21 14:16:07
  * @最后编辑         : 树
- * @最后编辑时间       : 2026-05-22 16:22:25
+ * @最后编辑时间       : 2026-05-24 17:41:42
  * @Version      : V1.0.0
  * @功能描述         : 一个简单的TCP客户端循环示例，每2秒向服务器发送一次控制命令并接收响应。
  *
@@ -51,6 +51,7 @@ typedef struct
     double vy;
     double wz;
     char log_file[128];
+    int crash_after; // 业务层面未使用，预留给未来可能的崩溃日志或核心转储路径
 } AppConfig;
 
 static FILE *g_log_fp = NULL; /* 全局日志文件指针；若成功打开则向磁盘追加日志 */
@@ -67,6 +68,7 @@ static void set_default_config(AppConfig *cfg)
     cfg->vx = 0.10;
     cfg->vy = 0.00;
     cfg->wz = 0.20;
+    cfg->crash_after = -1;
     snprintf(cfg->log_file, sizeof(cfg->log_file), "/var/log/base_client.log");
 }
 
@@ -151,6 +153,10 @@ static int load_config(const char *path, AppConfig *cfg)
         else if (strcmp(key, "wz") == 0)
         {
             cfg->wz = atof(value);
+        }
+        else if (strcmp(key, "crash_after") == 0)
+        {
+            cfg->crash_after = atoi(value);
         }
     }
     fclose(fp);
@@ -400,18 +406,44 @@ int main(int argc, char *argv[])
     fflush(stdout);
 
     /* 主循环：每次调用 send_once 发送一次命令并等待响应。
-     * 注意：此处使用 sleep(2) 固定间隔，未使用 cfg.period_ms；若需要基于配置的周期控制，请替换为
-     * 基于时间戳的等待（例如 clock_gettime + nanosleep），以获得更精确的周期行为并避免累积漂移（drift）。
+     * 说明：
+     * - 本循环为演示用途，使用固定的 sleep(2) 间隔发送命令；生产环境应使用基于时间的调度
+     *  （例如使用 cfg.period_ms + clock_gettime/nanosleep）来避免累积漂移并提高精度。
+     * - 该循环包含一个可选的崩溃模拟分支（cfg.crash_after），用于测试程序在异常退出时的行为。
      */
     while (1)
     {
+        /* 崩溃模拟：当 seq 达到 cfg.crash_after（>0）时，模拟异常退出以便生成日志/核心转储用于调试。
+         * 业务影响：这是测试/开发时的辅助开关，生产环境不要依赖该行为；若需要生成 core 文件
+         * 请改用 abort() 并在运行环境启用 core dumps。
+         */
+        if (cfg.crash_after > 0 && seq >= cfg.crash_after)
+        {
+            log_msg("ERROR", "simulate crash after seq=%d", seq);
+            /* 先 flush stdout，再关闭日志文件，确保所有日志写入磁盘后再退出 */
+            fflush(stdout);
+            close_log_file();
+            /* 返回非0状态表示异常退出；调用方或上层监控可据此触发重启或上报 */
+            return 2;
+        }
+
+        /* 发送一次控制命令并处理响应。send_once 内部已完成与服务器的短连接交互。
+         * - 成功时返回 0，并已在内部打印状态（包括 battery）。
+         * - 失败时返回非0，此处仅记录警告并在下次循环重试（不做重传或停机）。
+         */
         if (send_once(&cfg, seq) != 0)
         {
             log_msg("WARN", "loop %d failed,will retry", seq);
             fflush(stdout);
         }
+
+        /* 序号递增：用于下一次请求的识别，与服务端返回的 seq 做对比以检测乱序/重放 */
         seq++;
-        sleep(2); // 每2秒发送一次（演示用），生产环境按 cfg.period_ms 精确控制
+
+        /* 固定睡眠：每次循环等待固定时间后再发下一次请求（演示用）。生产环境请基于 cfg.period_ms
+         * 实现更精确的周期控制。sleep(2) 为阻塞调用，会影响响应及时性，但实现简单。
+         */
+        sleep(2); // 每2秒发送一次（演示用）
     }
     close_log_file();
     return 0;
