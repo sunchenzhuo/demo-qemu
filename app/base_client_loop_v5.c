@@ -3,7 +3,7 @@
  * @作者           : 树
  * @创建时间         : 2026-05-21 14:16:07
  * @最后编辑         : 树
- * @最后编辑时间       : 2026-05-25 17:13:22
+ * @最后编辑时间       : 2026-05-25 15:59:31
  * @Version      : V1.0.0
  * @功能描述         : 一个简单的TCP客户端循环示例，每2秒向服务器发送一次控制命令并接收响应。
  *
@@ -44,18 +44,14 @@
  */
 typedef struct
 {
-    char server_ip[64]; // 预留给未来可能的服务器IP配置
-    int server_port;    // 预留给未来可能的服务器端口配置
-    int period_ms;      // 预留给未来可能的周期配置
-    double vx;          // 预留给未来可能的默认运动指令配置
-    double vy;          // 预留给未来可能的默认运动指令配置
-    double wz;          // 预留给未来可能的默认运动指令配置
-    char log_file[128]; // 预留给未来可能的日志文件路径配置
-    int crash_after;    // 预留给未来可能的崩溃日志或核心转储路径
-    int max_fail_count; // 预留给未来可能的连续失败重试逻辑
-    double safe_vx;     // 预留给未来可能的安全速度限制参数
-    double safe_vy;     // 预留给未来可能的安全速度限制参数
-    double safe_wz;     // 预留给未来可能的安全角速度限制参数
+    char server_ip[64];
+    int server_port;
+    int period_ms;
+    double vx;
+    double vy;
+    double wz;
+    char log_file[128];
+    int crash_after; // 业务层面未使用，预留给未来可能的崩溃日志或核心转储路径
 } AppConfig;
 
 static FILE *g_log_fp = NULL; /* 全局日志文件指针；若成功打开则向磁盘追加日志 */
@@ -73,10 +69,6 @@ static void set_default_config(AppConfig *cfg)
     cfg->vy = 0.00;
     cfg->wz = 0.20;
     cfg->crash_after = -1;
-    cfg->max_fail_count = 3;
-    cfg->safe_vx = 0.0;
-    cfg->safe_vy = 0.0;
-    cfg->safe_wz = 0.0;
     snprintf(cfg->log_file, sizeof(cfg->log_file), "/var/log/base_client.log");
 }
 
@@ -165,23 +157,6 @@ static int load_config(const char *path, AppConfig *cfg)
         else if (strcmp(key, "crash_after") == 0)
         {
             cfg->crash_after = atoi(value);
-        }
-        else if (strcmp(key, "max_fail_count") == 0)
-        {
-            cfg->max_fail_count = atoi(value);
-        }
-
-        else if (strcmp(key, "safe_vx") == 0)
-        {
-            cfg->safe_vx = atof(value);
-        }
-        else if (strcmp(key, "safe_vy") == 0)
-        {
-            cfg->safe_vy = atof(value);
-        }
-        else if (strcmp(key, "safe_wz") == 0)
-        {
-            cfg->safe_wz = atof(value);
         }
     }
     fclose(fp);
@@ -432,7 +407,6 @@ int main(int argc, char *argv[])
 
     int fail_count = 0;       // 连续失败次数
     int was_disconnected = 0; // 之前是否处于断链状态
-    int safe_mode = 0;        // 是否进入安全模式（基于 safe_vx/safe_vy/safe_wz）
 
     /* 主循环：每次调用 send_once 发送一次命令并等待响应。
      * 说明：
@@ -449,27 +423,36 @@ int main(int argc, char *argv[])
         if (cfg.crash_after > 0 && seq >= cfg.crash_after)
         {
             log_msg("ERROR", "simulate crash after seq=%d", seq);
-            ;
+            /* 先 flush stdout，再关闭日志文件，确保所有日志写入磁盘后再退出 */
+            fflush(stdout);
             close_log_file();
             /* 返回非0状态表示异常退出；调用方或上层监控可据此触发重启或上报 */
             return 2;
         }
 
-        int ret = send_once(&cfg, seq);
-        if (ret != 0)
+        /* 发送一次控制命令并处理响应。send_once 内部已完成与服务器的短连接交互。
+         * - 成功时返回 0，并已在内部打印状态（包括 battery）。
+         * - 失败时返回非0，此处仅记录警告并在下次循环重试（不做重传或停机）。
+         */
+        /*
+         * 处理一次 send_once 的返回结果：
+         * - 如果返回非0，表示本次通信（连接/发送/接收/解析）失败：
+         *     1) 将连续失败计数 `fail_count` 增加；
+         *     2) 将 `was_disconnected` 置为 1，用于记录当前处于断链/失败状态；
+         *     3) 打印 WARN 日志并立即 flush，以便能够尽快看到错误信息；
+         *     4) 下次循环继续重试（该客户端不做重传，仅记录失败）。
+         * - 如果返回0，表示本次通信成功：
+         *     1) 若之前处于断链状态（`was_disconnected` 为真），打印 INFO 日志说明通信已恢复，日志中包含恢复时的循环序号和之前的连续失败次数；
+         *     2) 将 `fail_count` 重置为 0，清除 `was_disconnected` 标志，恢复正常计数。
+         */
+        if (send_once(&cfg, seq) != 0)
         {
             /* 通信失败，记录并标记为断链状态 */
             fail_count++;
             was_disconnected = 1;
 
             log_msg("WARN", "loop %d communication failed,fail_count=%d,will retry", seq, fail_count);
-
-            if (fail_count >= cfg.max_fail_count && !safe_mode)
-            {
-                safe_mode = 1;
-                log_msg("ERROR",
-                        "enter safe mode: fail_count=%d, command speed set to %.2f %.2f %.2f", fail_count, cfg.safe_vx, cfg.safe_vy, cfg.safe_wz);
-            }
+            fflush(stdout);
         }
         else
         {
@@ -480,15 +463,9 @@ int main(int argc, char *argv[])
                 fflush(stdout);
             }
 
-            if (safe_mode)
-            {
-                log_msg("INFO", "leave safe mode");
-            }
-
             /* 重置失败计数和断链标志，恢复正常状态 */
             fail_count = 0;
             was_disconnected = 0;
-            safe_mode = 0;
         }
 
         /* 序号递增：用于下一次请求的识别，与服务端返回的 seq 做对比以检测乱序/重放 */
